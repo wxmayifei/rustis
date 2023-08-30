@@ -145,10 +145,7 @@ impl NetworkHandler {
     }
 
     async fn network_loop(&mut self) -> Result<()> {
-        let mut counter = 0u64;
         loop {
-            counter += 1;
-            log::debug!("run network_loop {}", counter);
             select! {
                 msg = self.msg_receiver.next().fuse() => {
                     if !self.handle_message(msg).await { break; }
