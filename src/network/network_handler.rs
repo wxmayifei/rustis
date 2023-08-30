@@ -7,9 +7,12 @@ use crate::{
 };
 use futures_channel::{mpsc, oneshot};
 use futures_util::{select, FutureExt, SinkExt, StreamExt};
-use log::{trace, debug, error, info, log_enabled, warn, Level};
+use log::{debug, error, info, log_enabled, trace, warn, Level};
 use smallvec::SmallVec;
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Duration,
+};
 use tokio::sync::broadcast;
 
 pub(crate) type MsgSender = mpsc::UnboundedSender<Message>;
@@ -92,6 +95,7 @@ pub(crate) struct NetworkHandler {
     auto_remonitor: bool,
     max_command_attempts: usize,
     tag: String,
+    reconnect_interval: Duration,
 }
 
 impl NetworkHandler {
@@ -100,7 +104,11 @@ impl NetworkHandler {
         let auto_resubscribe = config.auto_resubscribe;
         let auto_remonitor = config.auto_remonitor;
         let max_command_attempts = config.max_command_attempts;
-
+        let reconnect_interval = if let Some(interval) = config.reconnect_interval {
+            interval
+        } else {
+            Duration::from_secs(10)
+        };
         let connection = Connection::connect(config).await?;
         let (msg_sender, msg_receiver): (MsgSender, MsgReceiver) = mpsc::unbounded();
         let (reconnect_sender, _): (ReconnectSender, ReconnectReceiver) = broadcast::channel(32);
@@ -124,14 +132,12 @@ impl NetworkHandler {
             auto_remonitor,
             max_command_attempts,
             tag,
+            reconnect_interval,
         };
 
         let join_handle = spawn(async move {
             if let Err(e) = network_handler.network_loop().await {
-                error!(
-                    "[{}] network loop ended in error: {e}",
-                    network_handler.tag
-                );
+                error!("[{}] network loop ended in error: {e}", network_handler.tag);
             }
         });
 
@@ -139,13 +145,16 @@ impl NetworkHandler {
     }
 
     async fn network_loop(&mut self) -> Result<()> {
+        let mut counter = 0u64;
         loop {
+            counter += 1;
+            log::debug!("run network_loop {}", counter);
             select! {
                 msg = self.msg_receiver.next().fuse() => {
                     if !self.handle_message(msg).await { break; }
                 } ,
                 value = self.connection.read().fuse() => {
-                    self.handle_result(value).await;
+                    self.handle_result(value).await
                 }
             }
         }
@@ -156,7 +165,6 @@ impl NetworkHandler {
 
     async fn handle_message(&mut self, mut msg: Option<Message>) -> bool {
         let is_channel_closed: bool;
-
         loop {
             if let Some(mut msg) = msg {
                 trace!("[{}] Will handle message: {msg:?}", self.tag);
@@ -226,8 +234,7 @@ impl NetworkHandler {
                     Status::Disconnected => {
                         debug!(
                             "[{}] network disconnected, queuing command: {:?}",
-                            self.tag,
-                            msg.commands
+                            self.tag, msg.commands
                         );
                         self.messages_to_send.push_back(MessageToSend::new(msg));
                     }
@@ -276,11 +283,7 @@ impl NetworkHandler {
                 .iter()
                 .fold(0, |sum, msg| sum + msg.message.commands.len());
             if num_commands > 1 {
-                debug!(
-                    "[{}] sending batch of {} commands",
-                    self.tag,
-                    num_commands
-                );
+                debug!("[{}] sending batch of {} commands", self.tag, num_commands);
             }
         }
 
@@ -377,10 +380,7 @@ impl NetworkHandler {
                     Ok(resp_buf) if resp_buf.is_push_message() => match &mut self.push_sender {
                         Some(push_sender) => {
                             if let Err(e) = push_sender.send(result).await {
-                                warn!(
-                                    "[{}] Cannot send monitor result to caller: {e}",
-                                    self.tag
-                                );
+                                warn!("[{}] Cannot send monitor result to caller: {e}", self.tag);
                             }
                         }
                         None => {
@@ -415,10 +415,7 @@ impl NetworkHandler {
                     Ok(resp_buf) if resp_buf.is_monitor_message() => {
                         if let Some(push_sender) = &mut self.push_sender {
                             if let Err(e) = push_sender.send(result).await {
-                                warn!(
-                                    "[{}] Cannot send monitor result to caller: {e}",
-                                    self.tag
-                                );
+                                warn!("[{}] Cannot send monitor result to caller: {e}", self.tag);
                             }
                         }
                     }
@@ -428,10 +425,7 @@ impl NetworkHandler {
                     Ok(resp_buf) if resp_buf.is_monitor_message() => {
                         if let Some(push_sender) = &mut self.push_sender {
                             if let Err(e) = push_sender.send(result).await {
-                                warn!(
-                                    "[{}] Cannot send monitor result to caller: {e}",
-                                    self.tag
-                                );
+                                warn!("[{}] Cannot send monitor result to caller: {e}", self.tag);
                             }
                         }
                     }
@@ -477,7 +471,11 @@ impl NetworkHandler {
                                 error!("[{}] Cannot retry message: {e}", self.tag);
                             }
                         } else {
-                            trace!("[{}] Will respond to: {:?}", self.tag, message_to_receive.message);
+                            trace!(
+                                "[{}] Will respond to: {:?}",
+                                self.tag,
+                                message_to_receive.message
+                            );
                             match message_to_receive.message.commands {
                                 Commands::Single(_, Some(result_sender)) => {
                                     if let Err(e) = result_sender.send(result) {
@@ -507,7 +505,8 @@ impl NetworkHandler {
                                     }
                                 },
                                 Commands::None | Commands::Single(_, None) => {
-                                    debug!("[{}] forget value {result:?}", self.tag) // fire & forget
+                                    debug!("[{}] forget value {result:?}", self.tag)
+                                    // fire & forget
                                 }
                             }
                         }
@@ -540,6 +539,7 @@ impl NetworkHandler {
             }
             None => {
                 // disconnection errors could end here but ok values should match a value_sender instance
+
                 assert!(
                     result.is_err(),
                     "[{}] Received unexpected message: {result:?}",
@@ -607,9 +607,10 @@ impl NetworkHandler {
                                 None
                             } else {
                                 // last unsubscription notification received
-                                let Some(mut remaining) = self.pending_unsubscriptions.pop_front() else {
+                                let Some(mut remaining) = self.pending_unsubscriptions.pop_front()
+                                else {
                                     error!(
-                                        "[{}] Cannot find channel or pattern to remove: {}", 
+                                        "[{}] Cannot find channel or pattern to remove: {}",
                                         self.tag,
                                         String::from_utf8_lossy(channel_or_pattern)
                                     );
@@ -669,9 +670,7 @@ impl NetworkHandler {
                 message_to_receive.attempts += 1;
                 debug!(
                     "[{}]: {:?}: attempt {}",
-                    self.tag,
-                    message_to_receive.message.commands,
-                    message_to_receive.attempts
+                    self.tag, message_to_receive.message.commands, message_to_receive.attempts
                 );
             }
         }
@@ -682,8 +681,7 @@ impl NetworkHandler {
             {
                 debug!(
                     "[{}] {:?}, max attempts reached",
-                    self.tag,
-                    message_to_receive.message.commands
+                    self.tag, message_to_receive.message.commands
                 );
                 if let Some(message_to_receive) = self.messages_to_receive.pop_front() {
                     match message_to_receive.message.commands {
@@ -720,9 +718,7 @@ impl NetworkHandler {
                 message_to_send.attempts += 1;
                 debug!(
                     "[{}] {:?}: attempt {}",
-                    self.tag,
-                    message_to_send.message.commands,
-                    message_to_send.attempts
+                    self.tag, message_to_send.message.commands, message_to_send.attempts
                 );
             }
         }
@@ -733,8 +729,7 @@ impl NetworkHandler {
             {
                 debug!(
                     "[{}] {:?}, max attempts reached",
-                    self.tag,
-                    message_to_send.message.commands
+                    self.tag, message_to_send.message.commands
                 );
                 if let Some(message_to_send) = self.messages_to_send.pop_front() {
                     match message_to_send.message.commands {
@@ -764,16 +759,19 @@ impl NetworkHandler {
             } else {
                 break;
             }
+            ()
         }
 
         if let Err(e) = self.connection.reconnect().await {
             error!("[{}] Failed to reconnect: {e:?}", self.tag);
+            // add reconnect_interval to avoid cpu high caused by reconnect always running
+            tokio::time::sleep(self.reconnect_interval).await;
             return;
         }
 
         if self.auto_resubscribe {
             if let Err(e) = self.auto_resubscribe().await {
-                error!("[{}] Failed to reconnect: {e:?}", self.tag);
+                error!("[{}] Failed to auto resubscribe: {e:?}", self.tag);
                 return;
             }
         }

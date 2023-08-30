@@ -2,7 +2,7 @@ use crate::{
     client::{Client, ClientPreparedCommand},
     commands::InternalPubSubCommands,
     network::PubSubSender,
-    resp::{ByteBufSeed, CommandArgs, SingleArg, SingleArgCollection},
+    resp::{ByteBufSeed, Command, CommandArgs, SingleArg, SingleArgCollection},
     PubSubReceiver, Result,
 };
 use futures_util::{Stream, StreamExt};
@@ -14,7 +14,9 @@ use std::{
     fmt,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
+use tokio::sync::oneshot::Sender;
 
 /// Pub/Sub Message that can be streamed from [`PubSubStream`](PubSubStream)
 #[derive(Debug)]
@@ -125,6 +127,7 @@ pub struct PubSubStream {
     sender: PubSubSender,
     receiver: PubSubReceiver,
     client: Client,
+    heartbeat_shutdown: Option<Sender<()>>,
 }
 
 impl PubSubStream {
@@ -134,6 +137,17 @@ impl PubSubStream {
         receiver: PubSubReceiver,
         client: Client,
     ) -> Self {
+        let heartbeat_shutdown = {
+            if client.server_timeout > 0 {
+                Some(Self::start_heartbeat(
+                    client.clone(),
+                    client.server_timeout as u64,
+                ))
+            } else {
+                None
+            }
+        };
+
         Self {
             closed: false,
             channels,
@@ -142,6 +156,7 @@ impl PubSubStream {
             sender,
             receiver,
             client,
+            heartbeat_shutdown,
         }
     }
 
@@ -151,6 +166,17 @@ impl PubSubStream {
         receiver: PubSubReceiver,
         client: Client,
     ) -> Self {
+        let heartbeat_shutdown = {
+            if client.server_timeout > 0 {
+                Some(Self::start_heartbeat(
+                    client.clone(),
+                    client.server_timeout as u64,
+                ))
+            } else {
+                None
+            }
+        };
+
         Self {
             closed: false,
             channels: CommandArgs::default(),
@@ -159,6 +185,7 @@ impl PubSubStream {
             sender,
             receiver,
             client,
+            heartbeat_shutdown,
         }
     }
 
@@ -168,6 +195,17 @@ impl PubSubStream {
         receiver: PubSubReceiver,
         client: Client,
     ) -> Self {
+        let heartbeat_shutdown = {
+            if client.server_timeout > 0 {
+                Some(Self::start_heartbeat(
+                    client.clone(),
+                    client.server_timeout as u64,
+                ))
+            } else {
+                None
+            }
+        };
+
         Self {
             closed: false,
             channels: CommandArgs::default(),
@@ -176,6 +214,7 @@ impl PubSubStream {
             sender,
             receiver,
             client,
+            heartbeat_shutdown,
         }
     }
 
@@ -262,6 +301,33 @@ impl PubSubStream {
 
         Ok(())
     }
+
+    fn start_heartbeat(client: Client, mut timeout: u64) -> Sender<()> {
+        if timeout > 30 {
+            timeout -= 5;
+        } else if timeout > 5 {
+            timeout -= 2;
+        } else if timeout > 1 {
+            timeout -= 1;
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = Self::run_heartbeat(&client, Duration::from_secs(timeout)) => {}
+                _ = receiver =>{}
+            }
+        });
+        sender
+    }
+
+    async fn run_heartbeat(client: &Client, heartbeat_interval: Duration) {
+        loop {
+            _ = client
+                .send(Command::new("PING").arg("sub"), Some(false))
+                .await;
+            tokio::time::sleep(heartbeat_interval).await;
+        }
+    }
 }
 
 impl Stream for PubSubStream {
@@ -305,5 +371,8 @@ impl Drop for PubSubStream {
         if !shardchannels.is_empty() {
             let _result = self.client.sunsubscribe(shardchannels).forget();
         }
+        self.heartbeat_shutdown.take().map(|x| {
+            _ = x.send(());
+        });
     }
 }

@@ -31,13 +31,13 @@ use crate::{
 };
 use futures_channel::{mpsc, oneshot};
 use futures_util::Stream;
+use log::trace;
 use serde::de::DeserializeOwned;
 use std::{
     future::IntoFuture,
     sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::Duration,
 };
-use log::trace;
 
 /// Client with a unique connection to a Redis server.
 #[derive(Clone)]
@@ -48,6 +48,7 @@ pub struct Client {
     client_state: Arc<RwLock<ClientState>>,
     command_timeout: Duration,
     retry_on_error: bool,
+    pub(crate) server_timeout: usize,
 }
 
 impl Drop for Client {
@@ -83,6 +84,7 @@ impl Client {
         let config = config.into_config()?;
         let command_timeout = config.command_timeout;
         let retry_on_error = config.retry_on_error;
+        let server_timeout = config.server_timeout;
         let (msg_sender, network_task_join_handle, reconnect_sender) =
             NetworkHandler::connect(config.into_config()?).await?;
 
@@ -93,6 +95,7 @@ impl Client {
             client_state: Arc::new(RwLock::new(ClientState::new())),
             command_timeout,
             retry_on_error,
+            server_timeout,
         })
     }
 
@@ -475,7 +478,6 @@ impl<'a> PubSubCommands<'a> for &'a Client {
 
             self.subscribe_from_pub_sub_sender(&channels, &pub_sub_sender)
                 .await?;
-
             Ok(PubSubStream::from_channels(
                 channels,
                 pub_sub_sender,
